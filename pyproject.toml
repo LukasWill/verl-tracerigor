@@ -43,7 +43,7 @@ dependencies = [
     "pybind11",
     "pylatexenc",
     "ray>=2.10",
-    "tensordict==0.6.2",
+    "tensordict==0.15.5",
     "torchdata",
     'vllm==0.8.2',
     "transformers==4.49.0",
