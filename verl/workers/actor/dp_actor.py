@@ -232,22 +232,335 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batches = batch.split(micro_batch_size)
 
         log_probs_lst = []
+        entropy_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
 
             with torch.no_grad():
-                _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
+                entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
             log_probs_lst.append(log_probs)
+            entropy_lst.append(entropy)
         log_probs = torch.concat(log_probs_lst, dim=0)
+        entropys = torch.concat(entropy_lst, dim=0)
 
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
+            entropys = entropys[revert_indices]
 
-        return log_probs
+        return log_probs, entropys
+
+    def compute_attention_mass(self, data: DataProto) -> dict:
+        """
+        Run a probe forward pass to compute cross-segment attention mass.
+        Uses monkey-patched attention layers to capture post-RoPE Q, K and
+        computes segment attention mass in chunks — never materializes full T×T.
+
+        Segments:
+            P — Prompt/Observation language tokens (non-model-generated)
+            R — Reasoning tokens (<think>...</think>)
+            A — Action tokens (model-generated outside <think>)
+            V — Vision/image tokens (VLM only; auto-detected via config)
+
+        For LLM models: returns 3×3 mass matrix over {P, R, A}
+        For VLM models: returns 4×4 mass matrix over {P, R, A, V}
+
+        Processes one sample at a time for memory safety.
+
+        Args:
+            data: DataProto with input_ids, attention_mask, position_ids,
+                  responses, loss_mask, think_mask.
+                  meta_info keys:
+                    attn_layer_stride (int, default 4)
+                    attn_chunk_size (int, default 128)
+
+        Returns:
+            dict with:
+              'attention_mass': (batch_size, num_probed_layers, N, N) cpu tensor
+              'probed_layers': list[int]
+              'segment_names': list[str] — ['P','R','A'] or ['P','R','A','V']
+        """
+        from verl.utils.attention_probe import AttentionSegmentProbe, compute_segment_mass_chunked
+
+        self.actor_module.eval()
+
+        batch_size = data.batch.batch_size[0]
+        if batch_size == 0:
+            return {}
+
+        seq_len = data.batch['input_ids'].shape[1]
+        response_len = data.batch['responses'].shape[1]
+
+        layer_stride = data.meta_info.get('attn_layer_stride', 4)
+        chunk_size = data.meta_info.get('attn_chunk_size', 128)
+
+        # ---- Build full-sequence segment masks (bsz, seq_len) ----
+        device = data.batch['input_ids'].device
+
+        if 'loss_mask' in data.batch.keys():
+            loss_mask_full = data.batch['loss_mask'].bool()
+        else:
+            loss_mask_full = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+            loss_mask_full[:, -response_len:] = data.batch['attention_mask'][:, -response_len:].bool()
+
+        think_mask_full = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+        if 'think_mask' in data.batch.keys():
+            think_mask_full[:, -response_len:] = data.batch['think_mask'].bool()
+
+        attention_mask = data.batch['attention_mask'].bool()
+
+        # ---- Detect vision tokens for VLM models ----
+        # Following Frankenstein paper: vision tokens are identified by
+        # image_token_id / video_token_id in the model config (Qwen2.5-VL).
+        model = self.actor_module
+        while hasattr(model, 'module'):
+            model = model.module
+        image_token_id = getattr(getattr(model, 'config', None), 'image_token_id', None)
+        video_token_id = getattr(getattr(model, 'config', None), 'video_token_id', None)
+
+        v_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+        if image_token_id is not None:
+            v_mask |= (data.batch['input_ids'] == image_token_id)
+        if video_token_id is not None:
+            v_mask |= (data.batch['input_ids'] == video_token_id)
+        has_vision = v_mask.any().item()
+
+        # P = language prompt/observation. For VLM, exclude vision tokens from P.
+        if has_vision:
+            p_mask = attention_mask & ~loss_mask_full & ~v_mask
+        else:
+            p_mask = attention_mask & ~loss_mask_full
+        r_mask = think_mask_full & loss_mask_full           # reasoning (<think>/<reflection> tokens)
+        a_mask = loss_mask_full & ~think_mask_full          # action tokens
+
+        # ---- Attention sink mitigation ----
+        # The first content token (typically <|im_start|>) acts as an
+        # attention sink (arXiv 2309.17453).  Exclude it from P to avoid
+        # distorting cross-segment mass.  Dynamic detection handles variable
+        # left-padding in the rollout-replay path.
+        first_attended = attention_mask.long().argmax(dim=1)  # (bsz,)
+        if data.meta_info.get('attn_exclude_first_token', True):
+            for b in range(batch_size):
+                p_mask[b, first_attended[b].item()] = False
+
+        # ---- Prompt sub-segmentation (history vs current observation) ----
+        # When split_prompt_segments=True and obs_boundary_pos is available,
+        # split P into P_hist and P_curr using a chat-template boundary:
+        #   P_hist = system prompt + prior user/assistant turn pairs
+        #   P_curr = last user turn (current observation) + generation prompt
+        # The boundary is the <|im_start|> of the last user turn.
+        # This enables measuring R→P_hist (temporal consistency: how much
+        # reasoning references past conversation context) vs R→P_curr
+        # (observation grounding: how much reasoning attends to the
+        # current turn's input).
+        split_prompt = data.meta_info.get('split_prompt_segments', False)
+        has_obs_boundary = 'obs_boundary_pos' in data.non_tensor_batch
+        if split_prompt and has_obs_boundary:
+            obs_boundary = data.non_tensor_batch['obs_boundary_pos']
+            p_hist_mask = torch.zeros_like(p_mask)
+            p_curr_mask = torch.zeros_like(p_mask)
+            for b in range(batch_size):
+                # Use position of first attended token as the actual left-padding
+                # offset.  The previous code used
+                #     pad_offset = seq_len - attention_mask[b].sum()
+                # which OVER-estimates left-padding by (response_length -
+                # valid_resp_len) because it counts both left-side padding AND
+                # response-after-EOS padding.  obs_boundary_pos is relative to
+                # prompt start, so only left-padding should be added.
+                content_start = int(first_attended[b].item())
+                boundary = content_start + int(obs_boundary[b])
+                p_hist_mask[b, :boundary] = p_mask[b, :boundary]
+                p_curr_mask[b, boundary:] = p_mask[b, boundary:]
+        else:
+            split_prompt = False  # disable if boundary info unavailable
+
+        # Diagnostic: log segment counts for the first sample
+        if batch_size > 0:
+            p_cnt = int(p_mask[0].sum().item())
+            r_cnt = int(r_mask[0].sum().item())
+            a_cnt = int(a_mask[0].sum().item())
+            v_cnt = int(v_mask[0].sum().item()) if has_vision else 0
+            total_attn = int(attention_mask[0].sum().item())
+            diag_msg = (f"[ATTN_PROBE] Segment counts (sample 0): "
+                        f"P={p_cnt}, R={r_cnt}, A={a_cnt}")
+            if has_vision:
+                diag_msg += f", V={v_cnt}"
+            if split_prompt:
+                p_hist_cnt = int(p_hist_mask[0].sum().item())
+                p_curr_cnt = int(p_curr_mask[0].sum().item())
+                diag_msg += f"  (P_hist={p_hist_cnt}, P_curr={p_curr_cnt})"
+            diag_msg += f"  (total_attended={total_attn}, seq_len={seq_len})"
+            print(diag_msg)
+            if r_cnt == 0:
+                print("[ATTN_PROBE] WARNING: R segment is empty! "
+                      "think_mask may not match the reasoning format "
+                      "(e.g. <reflection> vs <think>).")
+
+        if split_prompt:
+            if has_vision:
+                segment_names = ['P_hist', 'P_curr', 'R', 'A', 'V']
+            else:
+                segment_names = ['P_hist', 'P_curr', 'R', 'A']
+        else:
+            segment_names = ['P', 'R', 'A', 'V'] if has_vision else ['P', 'R', 'A']
+        N = len(segment_names)
+
+        has_mm = 'multi_modal_inputs' in data.non_tensor_batch.keys()
+
+        # Check if per-turn mass is requested
+        compute_per_turn = data.meta_info.get('attn_per_turn', False)
+        has_eor = 'end_of_response_position_mask' in data.batch.keys()
+        compute_per_turn = compute_per_turn and has_eor
+
+        probe = AttentionSegmentProbe(
+            self.actor_module, layer_stride=layer_stride, chunk_size=chunk_size
+        )
+
+        all_mass = []
+        all_per_turn_mass = []  # list of per-sample turn mass lists
+
+        for i in range(batch_size):
+            sample_input_ids = data.batch['input_ids'][i:i + 1]
+            sample_attn_mask = data.batch['attention_mask'][i:i + 1]
+            sample_pos_ids = data.batch['position_ids'][i:i + 1]
+            if sample_pos_ids.dim() == 3:   # qwen2vl mrope: (1,3,seq) -> (3,1,seq)
+                sample_pos_ids = sample_pos_ids.transpose(0, 1)
+
+            if split_prompt:
+                if has_vision:
+                    sample_seg_masks = [
+                        p_hist_mask[i:i + 1], p_curr_mask[i:i + 1],
+                        r_mask[i:i + 1], a_mask[i:i + 1], v_mask[i:i + 1]
+                    ]
+                else:
+                    sample_seg_masks = [
+                        p_hist_mask[i:i + 1], p_curr_mask[i:i + 1],
+                        r_mask[i:i + 1], a_mask[i:i + 1]
+                    ]
+            elif has_vision:
+                sample_seg_masks = [
+                    p_mask[i:i + 1], r_mask[i:i + 1], a_mask[i:i + 1], v_mask[i:i + 1]
+                ]
+            else:
+                sample_seg_masks = [
+                    p_mask[i:i + 1], r_mask[i:i + 1], a_mask[i:i + 1]
+                ]
+
+            mm_kwargs = {}
+            if has_mm:
+                mm = data.non_tensor_batch['multi_modal_inputs'][i]
+                for key, val in mm.items():
+                    mm_kwargs[key] = val
+
+            try:
+                with probe.capture(sample_seg_masks, store_qk=compute_per_turn):
+                    with torch.no_grad():
+                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                            self.actor_module(
+                                input_ids=sample_input_ids,
+                                attention_mask=sample_attn_mask,
+                                position_ids=sample_pos_ids,
+                                **mm_kwargs,
+                                use_cache=False,
+                            )
+
+                layer_indices = probe.probed_layer_indices
+                sample_mass = torch.stack(
+                    [probe.results[li]['mass'] for li in layer_indices], dim=0
+                )  # (num_probed_layers, N, N)
+                all_mass.append(sample_mass)
+
+                # ---- Per-turn attention mass ----
+                if compute_per_turn:
+                    eor_full = data.batch['end_of_response_position_mask'][i].bool()
+                    # eor positions are in full-sequence space
+                    eor_positions = eor_full.nonzero(as_tuple=True)[0].tolist()
+
+                    per_turn_mass_i = []  # list of (num_layers, 2, N) per turn
+                    # 2 rows = [R_t query, A_t query], N cols = target segments
+
+                    prev_pos = 0
+                    for turn_idx, eor_pos in enumerate(eor_positions):
+                        # Turn t response region: [prev_pos, eor_pos] in full seq
+                        # R_t = r_mask within this turn's response
+                        # A_t = a_mask within this turn's response
+                        turn_r_mask = torch.zeros(1, seq_len, dtype=torch.bool, device=device)
+                        turn_a_mask = torch.zeros(1, seq_len, dtype=torch.bool, device=device)
+                        turn_r_mask[0, prev_pos:eor_pos + 1] = r_mask[i, prev_pos:eor_pos + 1]
+                        turn_a_mask[0, prev_pos:eor_pos + 1] = a_mask[i, prev_pos:eor_pos + 1]
+
+                        r_count = int(turn_r_mask.sum().item())
+                        a_count = int(turn_a_mask.sum().item())
+
+                        if r_count == 0 and a_count == 0:
+                            prev_pos = eor_pos + 1
+                            continue
+
+                        # Build turn-local source masks + full-sequence target masks
+                        # Source: [R_t, A_t], Target: [P, R, A, (V)]
+                        turn_src_masks = [turn_r_mask, turn_a_mask]
+                        # Full target masks stay the same as sample_seg_masks
+                        # Combine into unified segment list for compute_segment_mass_chunked:
+                        # We use source+target and compute the 2×N sub-matrix
+                        combined_masks = turn_src_masks + sample_seg_masks
+                        # combined_masks: [R_t, A_t, P, R, A, (V)]
+                        # We want mass[0, 2:], mass[1, 2:] = R_t→{P,R,A,(V)}, A_t→{P,R,A,(V)}
+
+                        layer_turn_mass = []
+                        for li in layer_indices:
+                            stored = probe.results[li]
+                            full_mass = compute_segment_mass_chunked(
+                                stored['q'], stored['k'], combined_masks,
+                                chunk_size=chunk_size,
+                            )  # (1, H, 2+N, 2+N)
+                            # Extract the 2×N sub-matrix (source=[R_t,A_t], target=[P,R,A,(V)])
+                            turn_mass_layer = full_mass[0, :, :2, 2:].mean(dim=0)  # (2, N)
+                            layer_turn_mass.append(turn_mass_layer.cpu())
+                            del full_mass
+
+                        # Stack over layers: (num_layers, 2, N)
+                        turn_mass_stacked = torch.stack(layer_turn_mass, dim=0)
+                        per_turn_mass_i.append({
+                            'turn': turn_idx,
+                            'mass': turn_mass_stacked,  # (num_layers, 2, N)
+                            'r_count': r_count,
+                            'a_count': a_count,
+                        })
+                        prev_pos = eor_pos + 1
+
+                    # Clean up stored Q, K to free memory
+                    for li in layer_indices:
+                        probe.results[li].pop('q', None)
+                        probe.results[li].pop('k', None)
+
+                    all_per_turn_mass.append(per_turn_mass_i)
+
+            except Exception as e:
+                print(f"[ATTN_PROBE] WARNING: Sample {i} failed: {e}")
+                # Clean up stored Q, K on failure
+                for li in probe.results:
+                    probe.results[li].pop('q', None)
+                    probe.results[li].pop('k', None)
+                continue
+
+        if not all_mass:
+            return {}
+
+        attention_mass = torch.stack(all_mass, dim=0)  # (batch, num_layers, N, N)
+
+        result = {
+            'attention_mass': attention_mass.cpu(),
+            'probed_layers': layer_indices,
+            'segment_names': segment_names,
+        }
+
+        if compute_per_turn and all_per_turn_mass:
+            result['per_turn_mass'] = all_per_turn_mass
+
+        return result
 
     def update_policy(self, data: DataProto):
         # make sure we are in training mode

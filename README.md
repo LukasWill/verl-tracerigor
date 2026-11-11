@@ -1,3 +1,11 @@
+> **verl-tracerigor.** This is the VERL build used to train the agents in
+> [*RLVR Makes Agents Win More, but Not Necessarily Reason Better*](https://openreview.net/forum?id=jsTJu11CIh)
+> with [TraceRigor](https://github.com/LukasWill/tracerigor). It is based on
+> [JamesKrW/verl](https://github.com/JamesKrW/verl) at `f0c9812` (VERL 0.2.0.dev) and
+> changes the PPO policy loss (asymmetric clip 0.2 / 0.28 with dual-clip 3.0), among other
+> things. See [TRACERIGOR_CHANGES.md](TRACERIGOR_CHANGES.md) for every modified file. The
+> upstream README follows unchanged.
+
 <h1 style="text-align: center;">verl: Volcano Engine Reinforcement Learning for LLM</h1>
 
 verl is a flexible, efficient and production-ready RL training library for large language models (LLMs).

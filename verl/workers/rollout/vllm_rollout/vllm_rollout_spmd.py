@@ -183,7 +183,7 @@ class vLLMRollout(BaseRollout):
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
 
-        idx = prompts.batch['input_ids']  # (bs, prompt_length)
+        idx = prompts.batch['input_ids']  # (bs, prompt_length) # this is whatever was in the generation batch's input_ids
         # left-padded attention_mask
         attention_mask = prompts.batch['attention_mask']
         position_ids = prompts.batch['position_ids']

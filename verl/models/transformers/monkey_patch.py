@@ -38,9 +38,23 @@ def apply_monkey_patch_to_qwen2():
         Qwen2Attention.forward = qwen2_attn_forward
 
 
+def apply_monkey_patch_to_qwen2_vl():
+    """Apply monkey patch for Qwen2-VL and Qwen2.5-VL models.
+    These models use multimodal RoPE (mrope) which requires special flash attention handling.
+    The patch replaces the flash attention forward to properly handle 3D position IDs."""
+    from verl.models.transformers.qwen2_vl import ulysses_flash_attn_forward
+    if is_transformers_version_in_range("4.45.0", "4.49.0"):
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLFlashAttention2
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLFlashAttention2
+        Qwen2VLFlashAttention2.forward = ulysses_flash_attn_forward
+        Qwen2_5_VLFlashAttention2.forward = ulysses_flash_attn_forward
+
+
 _PATCH_NAME_TO_FUNC = {
     'llama': apply_monkey_patch_to_llama,
     'qwen2': apply_monkey_patch_to_qwen2,
+    'qwen2_vl': apply_monkey_patch_to_qwen2_vl,
+    'qwen2_5_vl': apply_monkey_patch_to_qwen2_vl,
 }
 
 from transformers import PretrainedConfig

@@ -532,16 +532,64 @@ def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange)
             a float number indicating the fraction of policy gradient loss being clipped
 
     """
+    cliprange_low = 0.2
+    cliprange_high = 0.28
+    clip_ratio_c = 3.0
+
     negative_approx_kl = log_prob - old_log_prob
     ratio = torch.exp(negative_approx_kl)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
 
-    pg_losses = -advantages * ratio
-    pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(
+        ratio, 1 - cliprange_low, 1 + cliprange_high
+    )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    clip_pg_losses1 = torch.maximum(
+        pg_losses1, pg_losses2
+    )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), eos_mask)
 
-    pg_loss = verl_F.masked_mean(torch.max(pg_losses, pg_losses2), eos_mask)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses).float(), eos_mask)
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+    pg_loss = verl_F.masked_mean(pg_losses, eos_mask)
+
     return pg_loss, pg_clipfrac, ppo_kl
+
+#def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange):
+#    """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
+#
+#    Args:
+#        old_log_prob: `(torch.Tensor)`
+#            shape: (bs, response_length)
+#        log_prob: `(torch.Tensor)`
+#            shape: (bs, response_length)
+#        advantages: `(torch.Tensor)`
+#            shape: (bs, response_length)
+#        eos_mask: `(torch.Tensor)`
+#            shape: (bs, response_length)
+#        cliprange: (float)
+#            The clip range used in PPO. See https://arxiv.org/abs/1707.06347
+#
+#    Returns:
+#        pg_loss: `a scalar torch.Tensor`
+#            policy gradient loss computed via PPO
+#        pg_clipfrac: (float)
+#            a float number indicating the fraction of policy gradient loss being clipped
+#
+#    """
+#    negative_approx_kl = log_prob - old_log_prob
+#    ratio = torch.exp(negative_approx_kl)
+#    ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
+#
+#    pg_losses = -advantages * ratio
+#    pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+#
+#    pg_loss = verl_F.masked_mean(torch.max(pg_losses, pg_losses2), eos_mask)
+#    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses).float(), eos_mask)
+#    return pg_loss, pg_clipfrac, ppo_kl
 
 
 def compute_entropy_loss(logits, eos_mask):

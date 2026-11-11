@@ -14,8 +14,14 @@
 """
 Implement a multiprocess PPOCritic
 """
+
+# todo check list
+# update_critic
+# - [x] used response_mask
+# - [x] removed: if has_multi_modal_inputs:
+# - [x] response_mask = attention_mask[:, -response_length:] or attention_mask[:, -response_length - 1:-1]
+# done - first check on 10.08
 import itertools
-from typing import Iterable
 
 import torch
 import torch.distributed
@@ -26,9 +32,12 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.workers.critic import BasePPOCritic
+from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
+from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_functional import masked_mean
-from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
+from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outputs_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
@@ -94,7 +103,7 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                 # gather output if sp > 1
                 if self.ulysses_sequence_parallel_size > 1:
-                    values_rmpad = gather_outpus_and_unpad(values_rmpad,
+                    values_rmpad = gather_outputs_and_unpad(values_rmpad,
                                                            gather_dim=0,
                                                            unpad_dim=0,
                                                            padding_size=pad_size)
@@ -117,30 +126,54 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         if isinstance(self.critic_module, FSDP):
             grad_norm = self.critic_module.clip_grad_norm_(self.config.grad_clip)
+        elif isinstance(self.critic_module, FSDPModule):
+            grad_norm = fsdp2_clip_grad_norm_(self.critic_module.parameters(), max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.critic_module.parameters(), max_norm=self.config.grad_clip)
-        self.critic_optimizer.step()
+
+        # if grad_norm is not finite, skip the update
+        if not torch.isfinite(grad_norm):
+            print(f"WARN: grad_norm is not finite: {grad_norm}")
+            self.critic_optimizer.zero_grad()
+        else:
+            self.critic_optimizer.step()
         return grad_norm
 
     def compute_values(self, data: DataProto) -> torch.Tensor:
         self.critic_module.eval()
         micro_batch_size = data.meta_info['micro_batch_size']
-        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids']
-        batch = data.select(batch_keys=select_keys).batch
-        use_dynamic_bsz = data.meta_info['use_dynamic_bsz']
-        has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
+        # select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids']
+        # batch = data.select(batch_keys=select_keys).batch
+        # use_dynamic_bsz = data.meta_info['use_dynamic_bsz']
+        # has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
 
-        if has_multi_modal_inputs:
-            num_micro_batches = data.batch.batch_size[0] // micro_batch_size
-            non_tensor_select_keys = ['multi_modal_inputs']
-            micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
-        elif use_dynamic_bsz:
-            # split using dynamic bsz
-            max_token_len = data.meta_info['max_token_len'] * self.ulysses_sequence_parallel_size
-            micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+        # if has_multi_modal_inputs:
+        #     num_micro_batches = data.batch.batch_size[0] // micro_batch_size
+        #     non_tensor_select_keys = ['multi_modal_inputs']
+        #     micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+        # elif use_dynamic_bsz:
+        #     # split using dynamic bsz
+        #     max_token_len = data.meta_info['max_token_len'] * self.ulysses_sequence_parallel_size
+        #     micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+        # else:
+        #     micro_batches = batch.split(micro_batch_size)
+        
+        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        select_keys = (
+            ["responses", "input_ids", "response_mask", "attention_mask", "position_ids"]
+            if "response_mask" in data.batch
+            else ["responses", "input_ids", "attention_mask", "position_ids"]
+        )
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
         else:
-            micro_batches = batch.split(micro_batch_size)
-
+            micro_batches = data.split(micro_batch_size)
         values_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
@@ -153,7 +186,8 @@ class DataParallelPPOCritic(BasePPOCritic):
         responses = data.batch['responses']
         attention_mask = data.batch['attention_mask']
         response_length = responses.size(1)
-        values = values * attention_mask[:, -response_length - 1:-1]
+        # values = values * attention_mask[:, -response_length - 1:-1] # wrong slicing?
+        values = values * attention_mask[:, -response_length:] # correct slicing?
 
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
@@ -163,7 +197,7 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         return values
 
-    def update_critic(self, data: DataProto):
+    def update_critic(self, data: DataProto):  # called by verl/workers/fsdp_workers.py", line 834, in update_critic
         # make sure we are in training mode
         self.critic_module.train()
         metrics = {}
@@ -174,33 +208,44 @@ class DataParallelPPOCritic(BasePPOCritic):
             select_keys = ['input_ids', 'responses', 'attention_mask', 'position_ids', 'values', 'returns','loss_mask']
         else:
             select_keys = ['input_ids', 'responses', 'attention_mask', 'position_ids', 'values', 'returns']
-        batch = data.select(batch_keys=select_keys).batch
+        # batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        if has_multi_modal_inputs:
-            num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
-            non_tensor_select_keys = ['multi_modal_inputs']
-            dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
-        else:
-            dataloader = batch.split(self.config.ppo_mini_batch_size)
+        # if has_multi_modal_inputs:
+        #     num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
+        #     non_tensor_select_keys = ['multi_modal_inputs']
+        #     dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
+        # else:
+        #     dataloader = batch.split(self.config.ppo_mini_batch_size)
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         for epoch in range(self.config.ppo_epochs):
-            for batch_idx, data in enumerate(dataloader):
+            for batch_idx, mini_batch in enumerate(mini_batches):
                 # split batch into micro_batches
-                mini_batch = data
-                if has_multi_modal_inputs:
-                    num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
-                    micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
-                    self.gradient_accumulation=num_micro_batches
-                elif self.config.use_dynamic_bsz:
+                # mini_batch = data
+                # if has_multi_modal_inputs:
+                #     num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+                #     micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+                #     self.gradient_accumulation=num_micro_batches
+                # elif self.config.use_dynamic_bsz:
+                #     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                #     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                # else:
+                #     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                #     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-
                 self.critic_optimizer.zero_grad()
 
                 for data in micro_batches:
@@ -225,9 +270,10 @@ class DataParallelPPOCritic(BasePPOCritic):
                         loss_mask = data['loss_mask'][:, -response_length:]
                     else:
                         print("DEBUG: warning, loss_mask not found in critic update")
-                        loss_mask=data["attention_mask"][:, -response_length - 1:-1]
+                        # loss_mask=data["attention_mask"][:, -response_length - 1:-1] # wrong slicing?
+                        loss_mask=data["attention_mask"][:, -response_length:] # correct slicing?
 
-                    eos_mask = loss_mask 
+                    response_mask = loss_mask 
 
                     vpreds = self._forward_micro_batch(data)
 
@@ -236,11 +282,11 @@ class DataParallelPPOCritic(BasePPOCritic):
                     vf_loss, vf_clipfrac = core_algos.compute_value_loss(vpreds=vpreds,
                                                                          values=values,
                                                                          returns=returns,
-                                                                         eos_mask=eos_mask,
+                                                                         response_mask=response_mask,
                                                                          cliprange_value=self.config.cliprange_value)
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        loss = vf_loss * (len(data) / self.config.ppo_mini_batch_size)
+                        loss = vf_loss * (response_mask.shape[0] / self.config.ppo_mini_batch_size)
                     else:
                         loss = vf_loss / self.gradient_accumulation
 
@@ -249,7 +295,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                     data = {
                         'critic/vf_loss': vf_loss.detach().item(),
                         'critic/vf_clipfrac': vf_clipfrac.detach().item(),
-                        'critic/vpred_mean': masked_mean(vpreds, eos_mask).detach().item(),
+                        'critic/vpred_mean': masked_mean(vpreds, response_mask).detach().item(),
                     }
 
                     append_to_dict(metrics, data)

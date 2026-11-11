@@ -173,6 +173,11 @@ class ActorRolloutRefWorker(Worker):
 
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
 
+        # VL models: force vision tower attention to eager when using Ulysses SP
+        # The Ulysses flash attention patch doesn't receive position_ids from the vision encoder
+        if self.ulysses_sequence_parallel_size > 1 and hasattr(actor_model_config, 'vision_config'):
+            actor_model_config.vision_config._attn_implementation = 'eager'
+
         if use_remove_padding:
             from verl.models.registry import check_model_support_rmpad
             check_model_support_rmpad(actor_model_config.model_type)
@@ -248,6 +253,21 @@ class ActorRolloutRefWorker(Worker):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
+        # Freeze vision tower if configured (important for VLM RLFT)
+        use_orig_params = False
+        if self._is_actor and self.config.actor.get('freeze_vision_tower', False):
+            vision_tower = getattr(actor_module, 'visual', None)
+            if vision_tower is None and hasattr(actor_module, 'model'):
+                vision_tower = getattr(actor_module.model, 'visual', None)
+            if vision_tower is not None:
+                vision_tower.requires_grad_(False)
+                use_orig_params = True
+                if self.rank == 0:
+                    print(f"[{role} model] Vision tower is set to not trainable.")
+            else:
+                if self.rank == 0:
+                    print(f"[{role} model] No vision tower found.")
+
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
@@ -256,7 +276,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module,
             cpu_offload=cpu_offload,
             param_init_fn=init_fn,
-            use_orig_params=False,
+            use_orig_params=use_orig_params,
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),
             sharding_strategy=sharding_strategy,  # zero3
@@ -518,7 +538,8 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             output = self.actor.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={'old_log_probs': output},
+            log_probs, entropys = output
+            output = DataProto.from_dict(tensors={'old_log_probs': log_probs, 'entropys': entropys},
                                          meta_info={'temperature': self.config.rollout.temperature})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
@@ -536,6 +557,80 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_attention_mass(self, data: DataProto):
+        """Forward pass probe to compute cross-segment attention mass."""
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data = data.to(torch.cuda.current_device())
+
+        try:
+            result = self.actor.compute_attention_mass(data=data)
+        except Exception as e:
+            logger.warning(f'compute_attention_mass failed: {e}')
+            # Reset FSDP handle state if it was left in FORWARD after a crash
+            try:
+                if self.world_size > 1:
+                    self.actor.actor_module._handle.reshard(True)
+            except Exception:
+                pass
+            if self._is_offload_param:
+                try:
+                    offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                except Exception:
+                    pass
+            return DataProto.from_dict(
+                tensors={'attention_mass': torch.zeros(0)},
+                meta_info={'probed_layers': [], 'attn_shape': []},
+            )
+
+        if result and 'attention_mass' in result:
+            am = result['attention_mass']       # (n, num_layers, N, N) cpu
+            n = am.shape[0]
+            am_flat = am.reshape(n, -1).float()  # (n, num_layers*N*N)
+            meta = {
+                'probed_layers': result['probed_layers'],
+                'attn_shape': list(am.shape[1:]),  # [num_layers, N, N]
+                'segment_names': result.get('segment_names', ['P', 'R', 'A']),
+            }
+            # Per-turn mass (list of per-sample turn mass lists)
+            if 'per_turn_mass' in result:
+                # Serialize per-turn mass: convert tensors to lists for transport
+                serialized = []
+                for sample_turns in result['per_turn_mass']:
+                    sample_data = []
+                    for turn_data in sample_turns:
+                        sample_data.append({
+                            'turn': turn_data['turn'],
+                            'mass': turn_data['mass'].tolist(),  # (num_layers, 2, N) -> list
+                            'r_count': turn_data['r_count'],
+                            'a_count': turn_data['a_count'],
+                        })
+                    serialized.append(sample_data)
+                meta['per_turn_mass'] = serialized
+            output = DataProto.from_dict(
+                tensors={'attention_mass': am_flat},
+                meta_info=meta,
+            )
+        else:
+            output = DataProto.from_dict(
+                tensors={'attention_mass': torch.zeros(0)},
+                meta_info={'probed_layers': [], 'attn_shape': []},
+            )
+
+        output = output.to('cpu')
+
+        if self.world_size > 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        log_gpu_memory_usage('After compute_attention_mass', logger=logger)
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
 
@@ -550,7 +645,8 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             output = self.ref_policy.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={'ref_log_prob': output})
+            log_probs, _ = output  # unpack (log_probs, entropys) tuple
+            output = DataProto.from_dict(tensors={'ref_log_prob': log_probs})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to('cpu')
@@ -675,6 +771,10 @@ class CriticWorker(Worker):
         critic_model_config.num_labels = 1
 
         use_remove_padding = config.model.get('use_remove_padding', False)
+        # VL models: force vision tower attention to eager when using Ulysses SP
+        if self.ulysses_sequence_parallel_size > 1 and hasattr(critic_model_config, 'vision_config'):
+            critic_model_config.vision_config._attn_implementation = 'eager'
+
         if use_remove_padding:
             from verl.models.registry import check_model_support_rmpad
             check_model_support_rmpad(critic_model_config.model_type)
@@ -690,7 +790,7 @@ class CriticWorker(Worker):
             warnings.simplefilter("ignore")
             setattr(critic_model_config, 'classifier_dropout', 0.)
             setattr(critic_model_config, 'hidden_dropout', '0')
-            if "Qwen2.5-VL" in local_path:
+            if getattr(critic_model_config, 'model_type', None) == 'qwen2_5_vl':
                 from verl.models.transformers.modeling_qwen_2_5_vl_patch import Qwen2_5_VLForTokenClassification
                 critic_module = Qwen2_5_VLForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             torch_dtype=torch_dtype,
@@ -734,10 +834,25 @@ class CriticWorker(Worker):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
+        # Freeze vision tower if configured (important for VLM RLFT)
+        use_orig_params = False
+        if config.model.get('freeze_vision_tower', False):
+            vision_tower = getattr(critic_module, 'visual', None)
+            if vision_tower is None and hasattr(critic_module, 'model'):
+                vision_tower = getattr(critic_module.model, 'visual', None)
+            if vision_tower is not None:
+                vision_tower.requires_grad_(False)
+                use_orig_params = True
+                if self.rank == 0:
+                    print("[critic model] Vision tower is set to not trainable.")
+            else:
+                if self.rank == 0:
+                    print("[critic model] No vision tower found.")
+
         # Note: We force turn off CPUOffload for critic because it causes incorrect results when using grad accumulation
         critic_module = FSDP(critic_module,
                              param_init_fn=init_fn,
-                             use_orig_params=False,
+                             use_orig_params=use_orig_params,
                              auto_wrap_policy=auto_wrap_policy,
                              device_id=torch.cuda.current_device(),
                              sharding_strategy=sharding_strategy,

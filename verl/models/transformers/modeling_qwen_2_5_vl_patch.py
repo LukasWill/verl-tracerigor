@@ -265,6 +265,16 @@ class Qwen2_5_VLForTokenClassification(Qwen2_5_VLPreTrainedModel):
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
+            # Dummy visual pass to keep vision tower gradients flowing for FSDP sync
+            # when some batches in the data are text-only (no images or videos)
+            if pixel_values is None and pixel_values_videos is None:
+                config = self.config.vision_config
+                patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
+                dummy_pixel_values = torch.zeros((16, patch_dim), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+                dummy_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device=inputs_embeds.device)
+                dummy_embeds = self.visual(dummy_pixel_values, grid_thw=dummy_grid_thw)
+                inputs_embeds += 0.0 * dummy_embeds.mean()
+
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
                 
